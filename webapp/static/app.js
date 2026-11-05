@@ -38,6 +38,8 @@ const scanReadout = $("#scanReadout");
 const scanDuration = $("#scanDuration");
 const pointerMode = $("#pointerMode");
 const scanMode = $("#scanMode");
+const pcaMode = $("#pcaMode");
+const pcaPanel = $("#pcaPanel");
 const interactionModeSwitch = $("#interactionModeSwitch");
 const pointerControls = $("#pointerControls");
 const scanControls = $("#scanControls");
@@ -1411,6 +1413,9 @@ async function loadAnalysis(manifest) {
   state.regions = assignInstrumentRoles(loadedRegions);
   resetPointerMusicTimeline();
   state.emotion = normalizeEmotionProfile(manifest.emotion_profile);
+  window.PCA?.attach(canvasShell, canvas, $("#pcaReadout"));
+  const pcaReady = window.PCA?.load(manifest.pca) ?? false;
+  if (pcaMode) pcaMode.disabled = !pcaReady;
   const musicPlan = manifest.music_plan || null;
   if (musicPlan) {
     musicBpm.value = String(Math.max(40, Math.min(200, Math.round(Number(musicPlan.bpm) || 72))));
@@ -2496,9 +2501,85 @@ function resetScan(showMessage = true) {
   if (showMessage && state.regions.length) statusText.textContent = "The scan is reset at the left edge.";
 }
 
+const PCA_STRIP_METRICS = ["xValue", "yValue", "speedValue", "edgeValue"];
+
+/** Retitle the four signal metrics as the first four harmonics and show each
+ *  one's amplitude relative to the loudest partial in the hovered patch. */
+function renderPcaSignalStrip(patch) {
+  const base = patch?.baseFrequency || 220;
+  PCA_STRIP_METRICS.forEach((id, index) => {
+    const value = $(`#${id}`);
+    const label = value?.previousElementSibling;
+    if (label) label.textContent = `${base * (index + 1)} Hz`;
+    if (value) value.textContent = patch ? patch.amplitudes[index].toFixed(2) : "0.00";
+  });
+  $("#currentRegion").textContent = patch
+    ? `patch row ${patch.row}, column ${patch.col}`
+    : "Move over the grid";
+}
+
+/** Put the signal strip back to the pointer and scan labels. */
+function restoreSignalStripLabels() {
+  const labels = ["X", "Y", "SPEED", "EDGE"];
+  PCA_STRIP_METRICS.forEach((id, index) => {
+    const label = $(`#${id}`)?.previousElementSibling;
+    if (label) label.textContent = labels[index];
+  });
+}
+
 function setInteractionMode(mode) {
-  if (!['pointer', 'scan'].includes(mode)) return;
-  if (mode === "scan" && (state.eye.active || state.eye.starting)) stopEyeTracking(false);
+  if (!['pointer', 'scan', 'pca'].includes(mode)) return;
+  if (mode !== "pca") { restoreSignalStripLabels(); window.PCA?.setPatchListener(null); }
+  if (mode !== "pointer" && (state.eye.active || state.eye.starting)) stopEyeTracking(false);
+  // PCA exploration owns its own canvas overlay and audio graph. Entering it
+  // parks the pointer and scan engines; leaving it hands control straight back.
+  if (mode === "pca") {
+    pauseScan();
+    pausePointerMusicTimeline();
+    state.scan.engaged = false;
+    state.mode = "pca";
+    clearActiveRegion();
+    resetPointerCrossfade();
+    soundEngine.leave();
+    window.PCA?.setActive(true);
+    const info = window.PCA?.summary();
+    $("#pcaSummary").textContent = info
+      ? `${info.patches} patches · ${info.cols}×${info.rows} · ${(info.total * 100).toFixed(1)}% explained`
+      : "unavailable";
+    statusText.textContent = info
+      ? "PCA exploration is active. Move across the grid to hear each patch."
+      : "PCA data is not available for this artwork.";
+    if (pcaPanel) pcaPanel.hidden = !info;
+    // Both other transports must leave the screen. playScan() forces the mode
+    // back to "scan", so a visible Start button would silently throw the
+    // visitor out of PCA exploration.
+    scanControls.hidden = true;
+    pointerControls.hidden = true;
+    performanceScreen.classList.remove("scan-mode");
+    $("#modeEyebrow").textContent = "PCA";
+    $("#modeInstruction").textContent = info
+      ? `Hear ${info.patches} patches as overtone series`
+      : "PCA data is not available for this artwork";
+    // The signal strip normally reports pointer position and edge distance,
+    // neither of which exists here. It reports the harmonic amplitudes the
+    // patch is actually producing instead, which the panel does not show.
+    $("#signalLabel").textContent = "HARMONIC AMPLITUDES · 220 Hz";
+    window.PCA?.setPatchListener(renderPcaSignalStrip);
+    renderPcaSignalStrip(null);
+    pointerMode.classList.remove("active");
+    scanMode.classList.remove("active");
+    pcaMode?.classList.add("active");
+    pcaMode?.setAttribute("aria-pressed", "true");
+    performanceScreen.classList.remove("pointer-mode");
+    scanReadout.hidden = true;
+    canvasShell.classList.remove("scanning");
+    drawCanvas();
+    return;
+  }
+  window.PCA?.setActive(false);
+  if (pcaPanel) pcaPanel.hidden = true;
+  pcaMode?.classList.remove("active");
+  pcaMode?.setAttribute("aria-pressed", "false");
   if (mode === "pointer") {
     pauseScan();
     state.scan.engaged = false;
@@ -2577,6 +2658,15 @@ scanMode.addEventListener("click", (event) => {
   setSetupVisible(false);
   showToast("Left-to-Right mode ready");
 });
+pcaMode?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  setInteractionMode("pca");
+  setSetupVisible(false);
+  showToast("PCA exploration ready");
+});
+$("#pcaMapping")?.addEventListener("change", (event) => {
+  window.PCA?.setMapping(event.target.value);
+});
 interactionModeSwitch.addEventListener("click", () => {
   const nextMode = state.mode === "pointer" ? "scan" : "pointer";
   setInteractionMode(nextMode);
@@ -2645,12 +2735,14 @@ function updateGazeRegion(region, now = performance.now()) {
 }
 
 canvas.addEventListener("pointermove", (event) => {
+  if (state.mode === "pca") { window.PCA?.onPointerMove(event); return; }
   if (state.eye.active || state.mode !== "pointer") return;
   const position = pointerPosition(event);
   if (!position) return;
   updateExplorePosition(position.nx, position.ny, "mouse");
 });
 canvas.addEventListener("pointerleave", () => {
+  if (state.mode === "pca") { window.PCA?.onPointerLeave(); return; }
   if (state.mode !== "pointer" || state.eye.active) return;
   clearActiveRegion();
   publishOutput(true);

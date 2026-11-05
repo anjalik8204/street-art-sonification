@@ -62,11 +62,40 @@ analysis_lock = asyncio.Lock()
 external_output = ExternalOutputManager(OUTPUT_CONFIG)
 
 
+def demo_pca() -> dict[str, Any]:
+    """PCA block for the bundled demo artwork, computed once and cached.
+
+    The cache lives in the gitignored runtime directory rather than beside the
+    committed demo masks, so enabling PCA exploration never rewrites a shared
+    asset.
+    """
+    cache = RUNTIME_DIR / "demo-pca.json"
+    if cache.is_file():
+        try:
+            return json.loads(cache.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    try:
+        completed = subprocess.run(
+            [str(SAM_PYTHON), str(PCA_SCRIPT), "--image", str(DEMO_IMAGE), "--output", str(cache)],
+            cwd=ROOT, capture_output=True, text=True, timeout=120,
+        )
+        if completed.returncode != 0:
+            return {"available": False, "reason": (completed.stderr or "").strip()[-300:]}
+        result = json.loads(cache.read_text(encoding="utf-8"))
+        result["available"] = True
+        cache.write_text(json.dumps(result), encoding="utf-8")
+        return result
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return {"available": False, "reason": str(exc)[:300]}
+
+
 def demo_payload() -> dict[str, Any]:
     manifest = json.loads((DEMO_DIR / "regions.json").read_text(encoding="utf-8"))
     manifest["analysis_id"] = "demo"
     manifest["image_url"] = "/assets/demo/image"
     manifest["status"] = "ready"
+    manifest["pca"] = demo_pca()
     for region in manifest["regions"]:
         region["visual_mask_url"] = f"/assets/demo/{region['visual_mask']}"
         region["hit_mask_url"] = f"/assets/demo/{region['hit_mask']}"
