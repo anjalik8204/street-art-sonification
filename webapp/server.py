@@ -36,6 +36,7 @@ QWEN_PYTHON = ROOT / ".interaction-env" / "bin" / "python"
 SAM_PYTHON = ROOT / ".venv" / "bin" / "python"
 QWEN_MODEL = ROOT / "third_party" / "models" / "Qwen3-VL-2B-Instruct-4bit"
 SAM_SCRIPT = WEB_DIR / "analyze_regions.py"
+PCA_SCRIPT = WEB_DIR / "pca_analysis.py"
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
@@ -433,6 +434,60 @@ Return only one JSON object with four fields: full_frame, confidence, bbox, and 
 Set full_frame to true and bbox to the complete photograph rectangle whenever the photograph is already entirely street art, wall texture belongs to the work, the painted parts are disconnected, or the boundary is uncertain. Set full_frame to false only when a clearly bounded mural or graffiti work has unrelated scenery around it. The bbox must include every painted part, lettering, and relevant wall surface. Point must be exactly two numbers inside the work. Confidence is from 0 to 1."""
 
 
+def pca_content_box(manifest: dict[str, Any], preprocessing: dict[str, Any]) -> list[int] | None:
+    """Express the real-photograph rectangle in the finished artwork's pixels.
+
+    `content_box` is recorded in prepared-image coordinates, but SAM may then
+    crop the prepared image down to the artwork. Without this translation the
+    PCA grid would exclude the wrong strip of an isolated mural.
+    """
+    box = preprocessing.get("content_box")
+    if not box or len(box) != 4:
+        return None
+    crop = manifest.get("preprocessing", {}).get("crop", {}).get("prepared_rect")
+    if not crop or len(crop) != 4:
+        return [int(value) for value in box]
+    left = max(int(box[0]), int(crop[0])) - int(crop[0])
+    top = max(int(box[1]), int(crop[1])) - int(crop[1])
+    right = min(int(box[2]), int(crop[2])) - int(crop[0])
+    bottom = min(int(box[3]), int(crop[3])) - int(crop[1])
+    if right - left < 1 or bottom - top < 1:
+        return None
+    return [left, top, right, bottom]
+
+
+async def run_pca_analysis(
+    result_dir: Path, manifest: dict[str, Any], preprocessing: dict[str, Any]
+) -> dict[str, Any]:
+    """Fit the PCA latent space for the PCA exploration mode.
+
+    scikit-learn lives in the segmentation environment, not the server's, so
+    this runs through the same interpreter as SAM. PCA exploration is an extra
+    mode: if the fit fails, pointer and scan modes must still work, so the
+    reason is recorded and the analysis continues.
+    """
+    processed_image = manifest.get("processed_image", "artwork.png")
+    pca_path = result_dir / "pca.json"
+    command = [
+        str(SAM_PYTHON), str(PCA_SCRIPT),
+        "--image", str(result_dir / processed_image),
+        "--output", str(pca_path),
+    ]
+    content_box = pca_content_box(manifest, preprocessing)
+    if content_box:
+        command += ["--content-box", *[str(value) for value in content_box]]
+    try:
+        completed = await run_command(command, timeout=120)
+        if completed.returncode != 0:
+            reason = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "PCA analysis failed"
+            return {"available": False, "reason": reason[:300]}
+        result = json.loads(pca_path.read_text(encoding="utf-8"))
+        result["available"] = True
+        return result
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {"available": False, "reason": str(exc)[:300]}
+
+
 async def run_command(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
     return await asyncio.to_thread(
         subprocess.run,
@@ -515,6 +570,10 @@ async def analyze_job(job_id: str, image_path: Path, statement: str, preprocessi
 
             manifest_path = result_dir / "regions.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            job.update(stage="pca", message="Finding visual structure…", progress=88)
+            manifest["pca"] = await run_pca_analysis(result_dir, manifest, preprocessing)
+
             job.update(stage="music", message="Preparing the algorithmic music system…", progress=92)
             processed_image = manifest.get("processed_image", "artwork.png")
             music_plan = derive_music_plan(
